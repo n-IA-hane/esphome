@@ -40,7 +40,7 @@ class FakeSource : public media_source::MediaSource {
   }
   bool can_handle(const std::string &uri) const override { return true; }
   bool has_internal_playlist() const override { return this->internal_playlist; }
-  void report_(MediaSourceState state) { this->set_state_(state); }
+  void report(MediaSourceState state) { this->set_state_(state); }
 
   std::vector<std::string> played;
   std::vector<MediaSourceCommand> commands;
@@ -50,7 +50,7 @@ class FakeSource : public media_source::MediaSource {
 
 class FakeSpeaker : public speaker::Speaker {
  public:
-  size_t play_(const uint8_t *data, size_t length) override { return length; }
+  size_t play(const uint8_t *data, size_t length) override { return length; }
   void start() override { this->state_ = speaker::STATE_RUNNING; }
   void stop() override { this->state_ = speaker::STATE_STOPPED; }
   bool has_buffered_data() const override { return false; }
