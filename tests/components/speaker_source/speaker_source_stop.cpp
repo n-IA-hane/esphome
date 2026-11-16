@@ -133,16 +133,16 @@ TEST_F(SpeakerSourceStop, StopReachesASourceThatHasNotStartedYet) {
 
 TEST_F(SpeakerSourceStop, StopOfAStartingSourceThatGoesIdleLater) {
   this->play("http://a");
-  // An error before PLAYING advances the playlist past the source but keeps it pending, so the stop still reaches it
+  // A startup error is followed by an explicit stop before the source reports IDLE.
   this->report(MediaSourceState::ERROR);
-  EXPECT_EQ(this->playlist_advances(), 1);
-
-  this->command(media_player::MEDIA_PLAYER_COMMAND_STOP);
   EXPECT_EQ(this->source_.commands, std::vector<MediaSourceCommand>{MediaSourceCommand::STOP});
 
-  // Neither the stop nor the IDLE it causes advances the playlist again
+  this->command(media_player::MEDIA_PLAYER_COMMAND_STOP);
+  EXPECT_EQ(this->source_.commands,
+            (std::vector<MediaSourceCommand>{MediaSourceCommand::STOP, MediaSourceCommand::STOP}));
+
   this->report(MediaSourceState::IDLE);
-  EXPECT_EQ(this->playlist_advances(), 1);
+  EXPECT_EQ(this->playlist_advances(), 0);
   EXPECT_EQ(this->source_.played, std::vector<std::string>{"http://a"});
   EXPECT_EQ(this->player_.state, media_player::MEDIA_PLAYER_STATE_IDLE);
 }
@@ -186,15 +186,15 @@ TEST_F(SpeakerSourceStop, AnErrorBeforePlayingDoesNotHoldBackLaterItems) {
   this->enqueue("http://a");
   ASSERT_EQ(this->source_.played, std::vector<std::string>{"http://a"});
 
-  // The source cannot open the first item and fails before it reports PLAYING
+  // The failed item is retired once; the next item must not wait behind it.
   this->report(MediaSourceState::ERROR);
-  EXPECT_EQ(this->playlist_advances(), 1);
+  EXPECT_EQ(this->playlist_advances(), 0);
 
   // An item enqueued after the failure plays instead of waiting behind it
   this->enqueue("http://b");
   EXPECT_EQ(this->source_.played, (std::vector<std::string>{"http://a", "http://b"}));
   EXPECT_EQ(this->source_.commands, std::vector<MediaSourceCommand>{MediaSourceCommand::STOP});
-  EXPECT_EQ(this->playlist_advances(), 1);
+  EXPECT_EQ(this->playlist_advances(), 0);
 }
 
 TEST_F(SpeakerSourceStop, NaturalEndAdvancesThePlaylist) {
@@ -206,6 +206,122 @@ TEST_F(SpeakerSourceStop, NaturalEndAdvancesThePlaylist) {
   EXPECT_EQ(this->playlist_advances(), 1);
   EXPECT_EQ(this->source_.played, (std::vector<std::string>{"http://a", "http://b"}));
   EXPECT_TRUE(this->source_.commands.empty());
+}
+
+TEST_F(SpeakerSourceStop, TerminalErrorStopsFailedMediaAndAdvancesWithoutRepeatRetry) {
+  this->source_.idle_on_stop = true;
+  this->play("http://failed");
+  this->report(MediaSourceState::PLAYING);
+  this->enqueue("http://next");
+  this->command(media_player::MEDIA_PLAYER_COMMAND_REPEAT_ONE);
+  this->source_.report(MediaSourceState::ERROR);
+  this->run_loop();
+  EXPECT_EQ(this->source_.commands, std::vector<MediaSourceCommand>{MediaSourceCommand::STOP});
+  EXPECT_EQ(this->source_.played, (std::vector<std::string>{"http://failed", "http://next"}));
+  EXPECT_NE(this->source_.get_state(), MediaSourceState::ERROR);
+  this->report(MediaSourceState::PLAYING);
+  EXPECT_EQ(this->player_.state, media_player::MEDIA_PLAYER_STATE_PLAYING);
+}
+
+TEST_F(SpeakerSourceStop, TerminalStartupErrorRetiresPendingSourceWithoutRetry) {
+  this->source_.idle_on_stop = true;
+  this->play("http://failed");
+  this->command(media_player::MEDIA_PLAYER_COMMAND_REPEAT_ALL);
+  this->source_.report(MediaSourceState::ERROR);
+  this->run_loop();
+  EXPECT_EQ(this->source_.commands, std::vector<MediaSourceCommand>{MediaSourceCommand::STOP});
+  EXPECT_EQ(this->source_.played, std::vector<std::string>{"http://failed"});
+  EXPECT_EQ(this->source_.get_state(), MediaSourceState::IDLE);
+  EXPECT_EQ(this->player_.state, media_player::MEDIA_PLAYER_STATE_IDLE);
+}
+
+TEST_F(SpeakerSourceStop, TerminalAnnouncementErrorPublishesCompletionAndKeepsMusic) {
+  FakeSpeaker ann_speaker;
+  FakeSource ann_source;
+  ann_source.idle_on_stop = true;
+  this->player_.set_speaker(ANNOUNCEMENT_PIPELINE, &ann_speaker);
+  this->player_.add_media_source(ANNOUNCEMENT_PIPELINE, &ann_source);
+  std::vector<media_player::MediaPlayerState> states;
+  this->player_.add_on_state_callback([&](auto state) { states.push_back(state); });
+  this->play("http://music");
+  this->report(MediaSourceState::PLAYING);
+  this->player_.make_call().set_media_url("http://tts").set_announcement(true).perform();
+  this->run_loop();
+  ann_source.report(MediaSourceState::PLAYING);
+  this->run_loop();
+  ASSERT_EQ(this->player_.state, media_player::MEDIA_PLAYER_STATE_ANNOUNCING);
+  ann_speaker.start();
+  ann_source.report(MediaSourceState::ERROR);
+  this->run_loop();
+  EXPECT_EQ(ann_source.commands, std::vector<MediaSourceCommand>{MediaSourceCommand::STOP});
+  EXPECT_EQ(ann_source.get_state(), MediaSourceState::IDLE);
+  EXPECT_TRUE(ann_speaker.is_stopped());
+  EXPECT_EQ(this->player_.state, media_player::MEDIA_PLAYER_STATE_PLAYING);
+  EXPECT_EQ(states.back(), media_player::MEDIA_PLAYER_STATE_PLAYING);
+  EXPECT_TRUE(this->source_.commands.empty());
+  // Clear the binding before local sources leave scope.
+  this->player_.make_call().set_command(media_player::MEDIA_PLAYER_COMMAND_STOP).set_announcement(true).perform();
+  this->run_loop();
+}
+
+TEST_F(SpeakerSourceStop, ErrorWaitsForSourceIdleBeforeStartingTheNextItem) {
+  this->play("http://failed");
+  this->report(MediaSourceState::PLAYING);
+  this->enqueue("http://next");
+  this->report(MediaSourceState::ERROR);
+  EXPECT_EQ(this->source_.commands, std::vector<MediaSourceCommand>{MediaSourceCommand::STOP});
+  EXPECT_EQ(this->source_.played, std::vector<std::string>{"http://failed"});
+  this->report(MediaSourceState::IDLE);
+  EXPECT_EQ(this->source_.played, (std::vector<std::string>{"http://failed", "http://next"}));
+  EXPECT_EQ(this->playlist_advances(), 0);
+}
+
+TEST_F(SpeakerSourceStop, AnUnownedErrorCannotStopCurrentMedia) {
+  FakeSource other;
+  this->player_.add_media_source(MEDIA_PIPELINE, &other);
+  this->play("http://current");
+  this->report(MediaSourceState::PLAYING);
+  other.report(MediaSourceState::ERROR);
+  this->run_loop();
+  EXPECT_TRUE(other.commands.empty());
+  EXPECT_TRUE(this->source_.commands.empty());
+  EXPECT_EQ(this->player_.state, media_player::MEDIA_PLAYER_STATE_PLAYING);
+}
+
+TEST_F(SpeakerSourceStop, AStoppedSourceErrorCannotDiscardItsReplacement) {
+  this->play("http://old");
+  this->report(MediaSourceState::PLAYING);
+  this->player_.make_call().set_media_url("http://replacement").perform();
+  this->player_.call();  // Process PLAY_URI, with the new item staged but the old source not yet IDLE.
+  this->source_.report(MediaSourceState::ERROR);
+  this->run_loop();
+  this->report(MediaSourceState::IDLE);
+  EXPECT_EQ(this->source_.played, (std::vector<std::string>{"http://old", "http://replacement"}));
+  EXPECT_EQ(this->playlist_advances(), 0);
+}
+
+TEST_F(SpeakerSourceStop, AStoppedPendingSourceErrorCannotDiscardItsReplacement) {
+  this->play("http://pending");
+  ASSERT_EQ(this->source_.get_state(), MediaSourceState::IDLE);
+  this->player_.make_call().set_media_url("http://replacement").perform();
+  this->player_.call();  // Replace the playlist before its deferred PLAY_CURRENT runs.
+  this->source_.report(MediaSourceState::ERROR);
+  this->run_loop();
+  this->report(MediaSourceState::IDLE);
+  EXPECT_EQ(this->source_.played, (std::vector<std::string>{"http://pending", "http://replacement"}));
+  EXPECT_EQ(this->playlist_advances(), 0);
+}
+
+TEST_F(SpeakerSourceStop, PendingReplacementAlreadyIdleDoesNotSuppressTheNextNaturalEnd) {
+  this->play("http://pending");
+  ASSERT_EQ(this->source_.get_state(), MediaSourceState::IDLE);
+  this->play("http://replacement");
+  this->report(MediaSourceState::PLAYING);
+  this->enqueue("http://following");
+  this->report(MediaSourceState::IDLE);
+  EXPECT_EQ(this->source_.played,
+            (std::vector<std::string>{"http://pending", "http://replacement", "http://following"}));
+  EXPECT_EQ(this->playlist_advances(), 1);
 }
 
 }  // namespace esphome::speaker_source::testing

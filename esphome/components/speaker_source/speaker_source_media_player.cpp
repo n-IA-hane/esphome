@@ -140,6 +140,34 @@ void SpeakerSourceMediaPlayer::handle_media_state_changed_(uint8_t pipeline, med
                                                            media_source::MediaSourceState state) {
   PipelineContext &ps = this->pipelines_[pipeline];
 
+  if (state == media_source::MediaSourceState::ERROR) {
+    // Only the current playback can retire its pipeline. Ignore another source's stale error.
+    if (ps.active_source != source && ps.pending_source != source)
+      return;
+    const bool was_stopping = ps.stopping_source == source;
+    ps.stopping_source = source;
+    if (!was_stopping && ps.playlist_index < ps.playlist.size()) {
+      // A failed item is terminal even with repeat enabled. Preserve the remaining playlist and shuffle order.
+      const size_t position = this->get_playlist_position_(pipeline);
+      ps.playlist.erase(ps.playlist.begin() + position);
+      if (!ps.shuffle_indices.empty()) {
+        ps.shuffle_indices.erase(ps.shuffle_indices.begin() + ps.playlist_index);
+        for (size_t &index : ps.shuffle_indices) {
+          if (index > position)
+            --index;
+        }
+      }
+      if (ps.playlist_index >= ps.playlist.size() && ps.repeat_mode == REPEAT_ALL && !ps.playlist.empty())
+        ps.playlist_index = 0;
+      if (ps.playlist_index < ps.playlist.size())
+        this->queue_play_current_(pipeline, ps.playlist_delay_ms);
+    }
+    // STOP joins decoder/reader owners. Their IDLE callback performs the existing speaker/pointer cleanup,
+    // with stopping_source suppressing a second playlist advance (including synchronous IDLE callbacks).
+    source->handle_command(media_source::MediaSourceCommand::STOP);
+    return;
+  }
+
   if (state == media_source::MediaSourceState::IDLE) {
     // Track whether this IDLE was from an orchestrator-initiated stop (e.g., NEXT/PREV/PLAY_URI)
     // so we can suppress spurious PLAYLIST_ADVANCE below
@@ -178,13 +206,6 @@ void SpeakerSourceMediaPlayer::handle_media_state_changed_(uint8_t pipeline, med
       if (ps.pending_source == source) {
         ps.pending_source = nullptr;
       }
-    }
-  } else if (state == media_source::MediaSourceState::ERROR) {
-    // A source that fails before reaching PLAYING never becomes the active source, so its IDLE never advances the
-    // playlist and every item enqueued after it would wait behind it. Advance past it now, unless it is being stopped.
-    // It stays pending so a stop still reaches it; its later IDLE advances nothing because it was never active.
-    if (ps.pending_source == source && ps.active_source != source && ps.stopping_source != source) {
-      this->queue_command_(MediaPlayerControlCommand::PLAYLIST_ADVANCE, pipeline);
     }
   }
 }
@@ -457,6 +478,12 @@ void SpeakerSourceMediaPlayer::process_control_queue_() {
 
   switch (control_command.type) {
     case MediaPlayerControlCommand::PLAY_URI: {
+      // Fence the old source before replacing its playlist: a delayed ERROR/IDLE belongs to that stopped item.
+      media_source::MediaSource *previous = active_source != nullptr ? active_source : ps.pending_source;
+      if (previous != nullptr && ps.stopping_source != previous) {
+        ps.stopping_source = previous;
+        previous->handle_command(media_source::MediaSourceCommand::STOP);
+      }
       // Always use our local playlist to start playback
       this->cancel_timeout(PIPELINE_TIMEOUT_IDS[pipeline]);
       ps.playlist.clear();
